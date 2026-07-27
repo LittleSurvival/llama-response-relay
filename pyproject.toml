@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llamacpp-launcher"
+version = "0.1.0"
+description = "A profile-based Windows launcher for llama.cpp"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.14,<4",
+    "customtkinter>=5.2,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pyinstaller>=6.0",
+]
+
+[project.gui-scripts]
+llamacpp-launcher = "llamacpp_launcher.ui:main"
+
+[tool.setuptools.packages.find]
+include = ["llamacpp_launcher*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
