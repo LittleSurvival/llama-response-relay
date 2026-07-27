@@ -103,6 +103,7 @@ def test_dashboard_session_aggregates_rates_slots_requests_and_resets() -> None:
     assert first.session_prompt_tokens == 100
     assert first.session_generated_tokens == 1200
     assert first.average_generated_tokens_per_second == 50
+    assert first.current_generated_tokens_per_second == 100
     assert first.active_slots == 2
     assert first.slot_occupancy == 0.5
     assert first.deferred_requests == 3
@@ -127,6 +128,39 @@ def test_dashboard_session_aggregates_rates_slots_requests_and_resets() -> None:
         or sample.generated_tokens_per_second >= 0
         for sample in reset.history
     )
+
+
+def test_generation_total_uses_active_slots_and_counter_fallback() -> None:
+    session = DashboardSession(1, "Parallel", 8, started_at=0)
+    first = session.record_native(
+        NativeSample(
+            timestamp=1,
+            metrics_state=Availability.AVAILABLE,
+            slots_state=Availability.AVAILABLE,
+            generated_tokens_total=100,
+            generated_tokens_per_second=20,
+            slots=parse_slots(
+                [
+                    {"id": 0, "is_processing": True},
+                    {"id": 1, "is_processing": True},
+                    {"id": 2, "is_processing": True},
+                    {"id": 3, "is_processing": False},
+                ]
+            ),
+        )
+    )
+    assert first.current_generated_tokens_per_second == 60
+    assert first.active_slots == 3
+
+    fallback = session.record_native(
+        NativeSample(
+            timestamp=3,
+            metrics_state=Availability.AVAILABLE,
+            slots_state=Availability.UNAVAILABLE,
+            generated_tokens_total=120,
+        )
+    )
+    assert fallback.current_generated_tokens_per_second == 10
 
 
 def test_session_stale_final_snapshot_request_summary_and_bounded_history() -> None:

@@ -1,4 +1,4 @@
-from llamacpp_launcher.ui import main
+from llamacpp_launcher.qt_ui.app import main
 
 
 if __name__ == "__main__":

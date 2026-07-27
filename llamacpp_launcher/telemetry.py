@@ -248,19 +248,18 @@ class DashboardSession:
             )
             self._record_counter("prompt_seconds", sample.prompt_seconds_total)
             self._record_counter("generated_seconds", sample.generated_seconds_total)
+            active_slots = self._sample_active_slots(sample)
             self._current_prompt_tps = self._current_rate(
                 sample.prompt_tokens_per_second, prompt_delta, elapsed
             )
-            self._current_generated_tps = self._current_rate(
-                sample.generated_tokens_per_second, generated_delta, elapsed
+            self._current_generated_tps = self._generation_total_rate(
+                sample.generated_tokens_per_second,
+                active_slots,
+                generated_delta,
+                elapsed,
             )
-            if sample.slots_state is Availability.AVAILABLE:
-                self._active_slots = sum(slot.is_processing for slot in sample.slots)
-            elif (
-                sample.metrics_state is Availability.AVAILABLE
-                and sample.requests_processing is not None
-            ):
-                self._active_slots = max(0, round(sample.requests_processing))
+            if active_slots is not None:
+                self._active_slots = active_slots
             if (
                 sample.metrics_state is Availability.AVAILABLE
                 and sample.requests_deferred is not None
@@ -331,6 +330,34 @@ class DashboardSession:
     ) -> float | None:
         if gauge is not None and gauge >= 0:
             return gauge
+        if token_delta is None or elapsed is None or elapsed <= 0:
+            return None
+        return max(0.0, token_delta / elapsed)
+
+    @staticmethod
+    def _sample_active_slots(sample: NativeSample) -> int | None:
+        if sample.slots_state is Availability.AVAILABLE:
+            return sum(slot.is_processing for slot in sample.slots)
+        if (
+            sample.metrics_state is Availability.AVAILABLE
+            and sample.requests_processing is not None
+        ):
+            return max(0, round(sample.requests_processing))
+        return None
+
+    @staticmethod
+    def _generation_total_rate(
+        per_slot_gauge: float | None,
+        active_slots: int | None,
+        token_delta: float | None,
+        elapsed: float | None,
+    ) -> float | None:
+        if (
+            per_slot_gauge is not None
+            and per_slot_gauge >= 0
+            and active_slots is not None
+        ):
+            return per_slot_gauge * active_slots
         if token_delta is None or elapsed is None or elapsed <= 0:
             return None
         return max(0.0, token_delta / elapsed)

@@ -10,17 +10,18 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.14,<4",
-    "customtkinter>=5.2,<6",
+    "PyQt6>=6.8,<7",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-qt>=4.4",
     "pyinstaller>=6.0",
 ]
 
 [project.gui-scripts]
-llamacpp-launcher = "llamacpp_launcher.ui:main"
+llamacpp-launcher = "llamacpp_launcher.qt_ui.app:main"
 
 [tool.setuptools.packages.find]
 include = ["llamacpp_launcher*"]
@@ -28,3 +29,4 @@ include = ["llamacpp_launcher*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+qt_api = "pyqt6"

@@ -2,6 +2,8 @@
 
 Windows 用的 llama.cpp 圖形化啟動器。可保存多個模型 Profile、隱藏執行 `llama-server.exe`，並透過內建 LRR interceptor 對 OpenAI 相容回應套用術語表。關閉 Launcher 時會停止由它啟動的 LRR 與 llama.cpp。
 
+桌面介面使用 PyQt6。本專案目前以符合 PyQt6 GPL 授權的方式開發與散布；若未來需要閉源或其他不相容的散布方式，必須先取得適用的商業授權或改用相容的 Qt binding。
+
 ## 環境與啟動
 
 需求：
@@ -114,25 +116,22 @@ LRR 只保留最近任務的數值摘要，不保存 prompt、response 文字或
 python -m pytest
 ```
 
-UI 手動狀態預覽：
+PyQt6 UI 手動狀態預覽：
 
 ```powershell
 $env:UI_PREVIEW_STATE = "Ready"
-$env:UI_PREVIEW_SCALING = "2.0"
+$env:QT_SCALE_FACTOR = "1.5"
 python tests\manual_ui_preview.py
 ```
 
 ## 建置 Windows EXE
 
-```powershell
-python -m pip install -e ".[dev]"
-python -m PyInstaller --clean --noconfirm LlamaCppLauncher.spec
-```
+`build.bat` 是本專案唯一正式建置入口。直接雙擊即可一鍵建置；腳本會建立獨立的 `.build-venv`、安裝所需套件、執行完整測試、正常關閉正在使用舊版輸出的 Launcher、移除舊 onedir，並在完成後開啟輸出位置。這能避免全域 Python 的過時套件或缺少 PyQt6 造成損壞的 bundle。
 
 輸出位於：
 
 ```text
-dist\LlamaCppLauncher\LlamaCppLauncher.exe
+dist\LlamaCppLauncher.exe
 ```
 
-採用 `onedir` 且不顯示額外 Console。建置設定會包含 CustomTkinter 的主題與字型資源；`llama-server.exe` 與模型仍由使用者從 UI 選擇，不會包含在發佈資料夾內。
+採用 `onefile` 且不顯示額外 Console，因此發布與移動時只需要 `LlamaCppLauncher.exe`。程式啟動時會把內含的 Python、PyQt6 與 aiohttp runtime 暫時解壓到系統 `%TEMP%`；`llama-server.exe` 與模型仍由使用者從 UI 選擇，不會包含在 EXE 內。

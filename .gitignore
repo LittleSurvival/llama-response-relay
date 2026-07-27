@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 .venv/
+.build-venv/
 /.codex
 /dist-modern
 /tmp

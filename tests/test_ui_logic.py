@@ -1,15 +1,44 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
+import json
+import queue
+import sys
+import threading
 import time
 
-import customtkinter as ctk
-import pytest
+from PyQt6.QtCore import QPoint, QTimer, Qt
+from PyQt6.QtWidgets import QApplication, QFrame, QMessageBox
 
-from llamacpp_launcher.dashboard_widgets import series_stats
-from llamacpp_launcher.models import AppSettings, Glossary, ValidationError
+from llamacpp_launcher.models import (
+    AppSettings,
+    Glossary,
+    GlossaryEntry,
+    Profile,
+)
 from llamacpp_launcher.process import RuntimeEvent, RuntimeState
+from llamacpp_launcher.qt_ui.bridge import RuntimeBridge
+from llamacpp_launcher.qt_ui.app import _run_packaged_smoke
+from llamacpp_launcher.qt_ui.components import (
+    ModernButton,
+    ModernComboBox,
+    ModernSpinBox,
+    NameDialog,
+    SmoothSwitch,
+)
+from llamacpp_launcher.qt_ui.crash_handler import CrashHandler, CrashLogDialog
+from llamacpp_launcher.qt_ui.lrr_page import LrrPage
+from llamacpp_launcher.qt_ui.presentation import (
+    context_per_slot_text,
+    control_states,
+    endpoint_text,
+    per_active_slot_rate,
+    profile_from_values,
+)
+from llamacpp_launcher.qt_ui.runtime_page import RuntimePage
+from llamacpp_launcher.qt_ui.settings_page import SettingsPage
+from llamacpp_launcher.qt_ui.window import LauncherWindow
+from llamacpp_launcher.qt_ui.style import application_icon
 from llamacpp_launcher.storage import SettingsStore
 from llamacpp_launcher.telemetry import (
     Availability,
@@ -17,333 +46,530 @@ from llamacpp_launcher.telemetry import (
     DashboardSnapshot,
     RequestSummary,
 )
-from llamacpp_launcher.theme import PALETTE
-from llamacpp_launcher.ui import (
-    LauncherApp,
-    context_per_slot_text,
-    control_states,
-    suggest_profile_name,
-    validate_profile_name,
-)
 
 
-@pytest.fixture(scope="module")
-def tk_parent() -> ctk.CTk:
-    root = ctk.CTk()
-    root.withdraw()
-    yield root
-    root.destroy()
+class FakeRuntime:
+    def __init__(self) -> None:
+        self.events: queue.Queue[RuntimeEvent] = queue.Queue(maxsize=2000)
+        self.state = RuntimeState.STOPPED
+        self.active_profile = ""
+        self.is_active = False
+        self.dashboard_snapshot = None
+        self.closed = 0
+
+    def stop(self, *, timeout_seconds: float = 10.0) -> None:
+        del timeout_seconds
+        self.state = RuntimeState.STOPPED
+        self.is_active = False
+
+    def close(self, *, timeout_seconds: float = 10.0) -> None:
+        self.stop(timeout_seconds=timeout_seconds)
+        self.closed += 1
 
 
-def ui_window(parent: ctk.CTk) -> ctk.CTkToplevel:
-    window = ctk.CTkToplevel(parent)
-    window.withdraw()
-    return window
-
-
-def test_stopped_controls_allow_start_and_edit() -> None:
-    states = control_states(RuntimeState.STOPPED, has_profile=True)
-    assert states == {"start": True, "stop": False, "restart": False, "edit": True}
-
-
-def test_starting_controls_keep_stop_available() -> None:
-    states = control_states(RuntimeState.STARTING, has_profile=True)
-    assert states["stop"]
-    assert not states["start"]
-    assert not states["edit"]
-
-
-def test_stopping_disables_lifecycle_actions() -> None:
-    states = control_states(RuntimeState.STOPPING, has_profile=True)
-    assert not states["start"]
-    assert not states["stop"]
-    assert not states["restart"]
-
-
-def test_theme_has_distinct_semantic_colors() -> None:
-    assert len({PALETTE["accent"], PALETTE["success"], PALETTE["warning"], PALETTE["error"]}) == 4
-    assert PALETTE["window"] != PALETTE["surface"]
-
-
-def test_chart_stats_ignore_gaps_and_keep_latest_and_peak() -> None:
-    assert series_stats([None, 2, None, 5, 3]) == (3, 5)
-    assert series_stats([None]) == (None, None)
-
-
-def test_profile_name_flow_suggests_and_validates_unique_names() -> None:
-    assert suggest_profile_name([]) == "New profile"
-    assert suggest_profile_name(["New profile", "New profile 2"]) == "New profile 3"
-    assert validate_profile_name("  Pink  ", ["Other"]) == "Pink"
-    with pytest.raises(ValidationError, match="already in use"):
-        validate_profile_name("pink", ["Pink"])
-
-
-def test_context_per_slot_hint_only_appears_for_multiple_slots() -> None:
-    assert context_per_slot_text("8192", "4") == (
-        "Each slot gets 2,048 context (8,192 ÷ 4)"
+def sample_snapshot(
+    *,
+    metrics_state: Availability = Availability.AVAILABLE,
+    slots_state: Availability = Availability.AVAILABLE,
+    stopped: bool = False,
+) -> DashboardSnapshot:
+    history = tuple(
+        ChartSample(
+            uptime_seconds=float(index),
+            prompt_tokens_per_second=10.0 + index,
+            generated_tokens_per_second=20.0 + index,
+            slot_occupancy=0.5,
+            deferred_requests=index % 2,
+        )
+        for index in range(4)
     )
-    assert context_per_slot_text("4096", "3") == (
-        "Each slot gets ~1,365.3 context (4,096 ÷ 3)"
+    return DashboardSnapshot(
+        generation=1,
+        profile_name="novelia",
+        uptime_seconds=65.0,
+        total_slots=4,
+        active_slots=2,
+        slot_occupancy=0.5,
+        deferred_requests=1,
+        session_prompt_tokens=120,
+        session_generated_tokens=80,
+        average_prompt_tokens_per_second=11.5,
+        average_generated_tokens_per_second=22.5,
+        current_prompt_tokens_per_second=13.0,
+        current_generated_tokens_per_second=23.0,
+        metrics_state=metrics_state,
+        slots_state=slots_state,
+        latest_request=RequestSummary(
+            endpoint="/v1/completions",
+            status=200,
+            input_tokens=30,
+            generated_tokens=20,
+            cached_tokens=15,
+            prompt_ms=20,
+            generated_ms=50,
+            time_to_first_byte_ms=32,
+            end_to_end_ms=88,
+        ),
+        history=history,
+        stopped=stopped,
     )
-    assert context_per_slot_text("4096", "1") == ""
-    assert context_per_slot_text("invalid", "2") == ""
 
 
-def test_ui_refreshes_models_and_saves_profile(
-    tmp_path: Path, tk_parent: ctk.CTk
+def test_presentation_helpers_cover_states_and_legacy_values() -> None:
+    stopped = control_states(
+        RuntimeState.STOPPED, has_profile=True, process_active=False
+    )
+    assert stopped.start and not stopped.stop and not stopped.restart
+    starting = control_states(
+        RuntimeState.STARTING, has_profile=True, process_active=True
+    )
+    assert not starting.start and starting.stop and starting.restart
+    assert context_per_slot_text(8192, 4) == "≈ 2,048 context per slot (8,192 ÷ 4)"
+    assert context_per_slot_text(8192, 1) == ""
+    assert endpoint_text("0.0.0.0", 8081) == "http://127.0.0.1:8081"
+    assert endpoint_text("127.0.0.1", 8081, enabled=False).startswith("Unavailable")
+    assert per_active_slot_rate(80.0, 4) == 20.0
+    assert per_active_slot_rate(80.0, 0) is None
+    assert per_active_slot_rate(None, 4) is None
+    profile = profile_from_values(
+        name=" Old Profile ",
+        model_path="C:/models/a.gguf",
+        host="127.0.0.1",
+        port="8080",
+        ngl="42",
+        context_size="8192",
+        parallel_slots="4",
+        flash_attention="auto",
+        no_mmap=True,
+        gpu_mode="multi",
+        custom_args="--threads 8",
+    )
+    assert profile.name == "Old Profile"
+    assert profile.parallel_slots == 4
+
+
+def _accept_name_dialog(value: str) -> None:
+    dialog = QApplication.activeModalWidget()
+    assert isinstance(dialog, NameDialog)
+    dialog.entry.setText(value)
+    dialog._accept()
+
+
+def test_settings_page_profile_crud_and_context_hint(
+    qtbot, tmp_path: Path, monkeypatch
 ) -> None:
-    llama_folder = tmp_path / "llama"
-    model_folder = tmp_path / "models"
-    llama_folder.mkdir()
-    model_folder.mkdir()
-    (llama_folder / "llama-server.exe").touch()
-    model = model_folder / "pink.gguf"
-    model.touch()
-    root = ui_window(tk_parent)
-    try:
-        app = LauncherApp(root, store=SettingsStore(tmp_path / "settings.json"))
-        app.llama_folder_var.set(str(llama_folder))
-        app.model_folder_var.set(str(model_folder))
-        app.settings.llama_cpp_folder = str(llama_folder)
-        app.settings.model_folder = str(model_folder)
-        app._refresh_models()
-        app.name_var.set("Pink")
-        app.model_var.set(model.name)
-        app._save_profile()
+    llama = tmp_path / "llama"
+    models = tmp_path / "models"
+    llama.mkdir()
+    models.mkdir()
+    (llama / "llama-server.exe").write_bytes(b"exe")
+    model = models / "novelia.gguf"
+    model.write_bytes(b"gguf")
+    settings = AppSettings(
+        llama_cpp_folder=str(llama),
+        model_folder=str(models),
+    )
+    store = SettingsStore(tmp_path / "settings.json")
+    page = SettingsPage(settings, store)
+    qtbot.addWidget(page)
+    page.show()
+    QTimer.singleShot(0, lambda: _accept_name_dialog("novelia"))
+    qtbot.mouseClick(page.new_button, Qt.MouseButton.LeftButton)
+    assert page.profile_list.currentItem().text() == "novelia"
+    assert page.profile_list.count() == 1
+    assert settings.profiles == []
+    page.apply_models([model.resolve()])
+    page.llama_path.edit.setText(str(llama))
+    page.model_folder.edit.setText(str(models))
+    page.context_spin.setValue(8192)
+    page.parallel_spin.setValue(4)
+    assert "2,048" in page.context_hint.text()
+    qtbot.mouseClick(page.save_button, Qt.MouseButton.LeftButton)
+    assert settings.selected_profile == "novelia"
+    QTimer.singleShot(0, lambda: _accept_name_dialog("novelia 2"))
+    qtbot.mouseClick(page.rename_button, Qt.MouseButton.LeftButton)
+    assert settings.selected_profile == "novelia 2"
+    qtbot.mouseClick(page.copy_button, Qt.MouseButton.LeftButton)
+    assert len(settings.profiles) == 2
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    qtbot.mouseClick(page.delete_button, Qt.MouseButton.LeftButton)
+    assert len(settings.profiles) == 1
 
-        assert app.profiles.names() == ["Pink"]
-        assert app.profiles.get("Pink").model_path == str(model.resolve())
-        assert (tmp_path / "settings.json").exists()
-        app.context_var.set("8192")
-        app.parallel_var.set("4")
-        assert app.context_allocation_var.get() == (
-            "Each slot gets 2,048 context (8,192 ÷ 4)"
-        )
-    finally:
-        root.destroy()
 
-
-def test_ui_switches_to_roomy_runtime_workspace(
-    tmp_path: Path, tk_parent: ctk.CTk
+def test_new_profile_draft_renames_and_deletes_in_rail(
+    qtbot, tmp_path: Path
 ) -> None:
-    root = ui_window(tk_parent)
-    try:
-        app = LauncherApp(root, store=SettingsStore(tmp_path / "settings.json"))
-        root.geometry("960x640")
-        root.update()
-        app._switch_view("Runtime")
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline and app.settings_view.place_info():
-            root.update()
-            time.sleep(0.01)
-
-        assert app._current_view == "Runtime"
-        assert app.runtime_view.winfo_manager() == "place"
-        assert app.settings_view.place_info() == {}
-        assert app.stop_button.winfo_exists()
-        assert int(app.runtime_dashboard.cget("height")) <= 640 * 0.40
-        assert app.runtime_view.grid_rowconfigure(1)["weight"] == 1
-        assert app.log_text.winfo_exists()
-    finally:
-        root.destroy()
+    settings = AppSettings()
+    page = SettingsPage(
+        settings,
+        SettingsStore(tmp_path / "settings.json"),
+    )
+    qtbot.addWidget(page)
+    page.show()
+    page.new_profile("Draft profile")
+    assert page.profile_list.currentItem().text() == "Draft profile"
+    page.rename_profile("Renamed draft")
+    assert page.profile_list.currentItem().text() == "Renamed draft"
+    assert page.heading.text() == "Renamed draft"
+    assert settings.profiles == []
+    page.delete_profile(confirm=False)
+    assert page.profile_list.count() == 0
+    assert page._draft_profile_name == ""
 
 
-def test_runtime_dashboard_renders_active_stale_and_stopped_snapshots(
-    tmp_path: Path, tk_parent: ctk.CTk
+def test_switching_away_discards_unsaved_profile_draft_without_stale_item(
+    qtbot, tmp_path: Path, monkeypatch
 ) -> None:
-    root = ui_window(tk_parent)
-    try:
-        app = LauncherApp(root, store=SettingsStore(tmp_path / "settings.json"))
-        snapshot = DashboardSnapshot(
-            generation=1,
-            profile_name="Pink",
-            uptime_seconds=65,
-            total_slots=4,
-            active_slots=3,
-            slot_occupancy=0.75,
-            deferred_requests=2,
-            session_prompt_tokens=1200,
-            session_generated_tokens=345,
-            average_prompt_tokens_per_second=40,
-            average_generated_tokens_per_second=12,
-            current_prompt_tokens_per_second=50,
-            current_generated_tokens_per_second=15,
-            metrics_state=Availability.AVAILABLE,
-            slots_state=Availability.STALE,
-            latest_request=RequestSummary(
-                endpoint="/v1/chat/completions",
-                status=200,
-                input_tokens=100,
-                generated_tokens=40,
-                cached_tokens=25,
-                prompt_ms=100,
-                generated_ms=500,
-                time_to_first_byte_ms=80,
-                end_to_end_ms=650,
-            ),
-            history=(
-                ChartSample(64, 45, 14, 0.5, 0),
-                ChartSample(65, 50, 15, 0.75, 2),
-            ),
-        )
-        app.status_var.set(RuntimeState.READY.value)
-        app._handle_runtime_event(
-            RuntimeEvent(
-                kind="telemetry", message="", payload=snapshot, generation=1
-            )
-        )
+    model = tmp_path / "saved.gguf"
+    model.write_bytes(b"gguf")
+    saved = Profile(name="Saved", model_path=str(model))
+    settings = AppSettings(
+        profiles=[saved],
+        selected_profile=saved.name,
+    )
+    page = SettingsPage(
+        settings,
+        SettingsStore(tmp_path / "settings.json"),
+    )
+    qtbot.addWidget(page)
+    page.show()
+    page.new_profile("Temporary")
+    assert page.profile_list.count() == 2
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
+    )
+    page.profile_list.setCurrentRow(0)
+    assert page.profile_list.count() == 1
+    assert page.profile_list.currentItem().text() == "Saved"
+    assert page.heading.text() == "Saved"
+    assert page._draft_profile_name == ""
 
-        assert app.runtime_identity_var.get() == "Pink · Ready · 01:05"
-        assert app.token_rate_var.get() == "15.0 tok/s"
-        assert app.slot_pressure_var.get() == "3/4 · 75%"
-        assert app.queue_var.get() == "2"
-        assert app.session_tokens_var.get() == "In 1.2K · Out 345"
-        assert "Cache 25%" in app.latest_task_var.get()
-        assert "Server 600ms" in app.latest_task_var.get()
-        assert "Slots Stale" in app.telemetry_health_var.get()
 
-        unsupported = replace(
-            snapshot,
-            active_slots=None,
-            slot_occupancy=None,
-            deferred_requests=None,
-            current_generated_tokens_per_second=None,
+def test_lrr_glossary_is_independent_and_entries_are_compact(
+    qtbot, tmp_path: Path, monkeypatch
+) -> None:
+    settings = AppSettings()
+    store = SettingsStore(tmp_path / "settings.json")
+    page = LrrPage(settings, store)
+    qtbot.addWidget(page)
+    page.show()
+    page.enabled.setChecked(True)
+    page.host.setText("127.0.0.1")
+    page.port.setValue(9090)
+    qtbot.mouseClick(page.save_lrr_button, Qt.MouseButton.LeftButton)
+    QTimer.singleShot(0, lambda: _accept_name_dialog("Travel"))
+    qtbot.mouseClick(page.new_button, Qt.MouseButton.LeftButton)
+    assert settings.selected_glossary_id
+    assert page.glossary_list.currentItem().text() == "Travel"
+    qtbot.mouseClick(page.add_button, Qt.MouseButton.LeftButton)
+    assert len(page.rows) == 2
+    row = page.rows[0]
+    row.source.setText("旅人")
+    row.replacement.setText("Traveler")
+    page.rows[1].source.setText("日記")
+    page.rows[1].replacement.setText("Journal")
+    assert row.maximumHeight() <= 48
+    assert row.enabled.isChecked()
+    qtbot.mouseClick(page.save_glossary_button, Qt.MouseButton.LeftButton)
+    glossary = settings.glossaries[0]
+    assert glossary.entries[0].case_sensitive is True
+    assert not hasattr(settings.profiles, "glossary")
+    QTimer.singleShot(0, lambda: _accept_name_dialog("Travel Notes"))
+    qtbot.mouseClick(page.rename_button, Qt.MouseButton.LeftButton)
+    assert settings.glossaries[0].name == "Travel Notes"
+    assert page.glossary_heading.text() == "Travel Notes"
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    qtbot.mouseClick(page.delete_button, Qt.MouseButton.LeftButton)
+    assert settings.glossaries == []
+
+
+def test_glossary_switch_autosaves_and_keeps_editor_aligned(
+    qtbot, tmp_path: Path, monkeypatch
+) -> None:
+    first = Glossary(
+        name="First",
+        entries=[GlossaryEntry(source="A", replacement="Old")],
+    )
+    second = Glossary(
+        name="Second",
+        entries=[GlossaryEntry(source="B", replacement="Two")],
+    )
+    settings = AppSettings(
+        glossaries=[first, second],
+        selected_glossary_id=first.id,
+    )
+    page = LrrPage(
+        settings,
+        SettingsStore(tmp_path / "settings.json"),
+    )
+    qtbot.addWidget(page)
+    page.show()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Glossary switching must not show a dialog")
+        ),
+    )
+
+    page.rows[0].replacement.setText("Autosaved")
+    page.add_entry()
+    page.glossary_list.setCurrentRow(1)
+    assert settings.glossaries[0].entries[0].replacement == "Autosaved"
+    assert len(settings.glossaries[0].entries) == 1
+    assert settings.selected_glossary_id == second.id
+    assert page.glossary_list.currentItem().text() == "Second"
+    assert page.glossary_heading.text() == "Second"
+    assert page.rows[0].source.text() == "B"
+
+    page.glossary_list.setCurrentRow(0)
+    invalid = page.add_entry()
+    invalid.replacement.setText("Missing source")
+    page.glossary_list.setCurrentRow(1)
+    assert settings.selected_glossary_id == first.id
+    assert page.glossary_list.currentItem().text() == "First"
+    assert page.glossary_heading.text() == "First"
+    assert "source text is required" in page.glossary_error.text().lower()
+
+
+def test_runtime_bridge_batches_600_logs_and_coalesces_telemetry(qtbot) -> None:
+    runtime = FakeRuntime()
+    bridge = RuntimeBridge(runtime, max_events_per_tick=120, interval_ms=1000)
+    bridge.timer.stop()
+    batches: list[str] = []
+    snapshots: list[DashboardSnapshot] = []
+    bridge.logs_ready.connect(lambda lines: batches.extend(lines))
+    bridge.telemetry_ready.connect(snapshots.append)
+    for index in range(600):
+        runtime.events.put_nowait(
+            RuntimeEvent(kind="log", source="stderr", message=f"line {index}")
+        )
+    first = sample_snapshot()
+    second = sample_snapshot(stopped=True)
+    runtime.events.put_nowait(
+        RuntimeEvent(kind="telemetry", message="first", payload=first)
+    )
+    runtime.events.put_nowait(
+        RuntimeEvent(kind="telemetry", message="second", payload=second)
+    )
+    bridge.drain()
+    qtbot.waitUntil(lambda: len(batches) == 600, timeout=3000)
+    qtbot.waitUntil(lambda: len(snapshots) == 1, timeout=3000)
+    assert snapshots[0].stopped
+
+
+def test_runtime_page_renders_states_logs_and_minimum_dashboard(qtbot) -> None:
+    page = RuntimePage()
+    qtbot.addWidget(page)
+    page.resize(760, 580)
+    page.show()
+    page.render_snapshot(sample_snapshot())
+    page.append_logs([f"line {index}" for index in range(650)])
+    assert "2 / 4" in page.slots.value.text()
+    assert page.generation.value.text() == "All-slot 23.0 tok/s"
+    assert page.generation.detail.text() == "Per-active-slot avg 11.5 tok/s"
+    assert "Latest client task" in page.latest.text()
+    assert page.throughput_chart.property("framed") is True
+    assert page.pressure_chart.property("framed") is True
+    assert page.dashboard.height() == 230
+    assert page.dashboard.height() <= int(page.height() * 0.40)
+    page.render_snapshot(
+        sample_snapshot(
             metrics_state=Availability.UNSUPPORTED,
-            slots_state=Availability.UNSUPPORTED,
-            history=(),
+            slots_state=Availability.STALE,
+            stopped=True,
         )
-        app._render_dashboard(unsupported)
-        assert app.token_rate_var.get() == "Unsupported"
-        assert app.slot_pressure_var.get() == "Unsupported"
-        assert app.queue_var.get() == "Unsupported"
-
-        stopped = replace(snapshot, active_slots=0, stopped=True)
-        app._render_dashboard(stopped)
-        assert "Stopped" in app.runtime_identity_var.get()
-        assert app.telemetry_health_var.get() == "Telemetry stopped · final snapshot"
-    finally:
-        root.destroy()
+    )
+    assert page.generation.value.text() == "Unsupported"
+    assert page.slots.value.text() == "Stale"
+    assert page.output.document().blockCount() <= 2000
 
 
-def test_ui_saves_and_selects_global_glossary(
-    tmp_path: Path, tk_parent: ctk.CTk
+def test_window_uses_three_qt_pages_and_resizes_under_load(
+    qtbot, tmp_path: Path, monkeypatch
 ) -> None:
-    model_folder = tmp_path / "models"
-    model_folder.mkdir()
-    model = model_folder / "pink.gguf"
-    model.touch()
-    root = ui_window(tk_parent)
-    try:
-        app = LauncherApp(root, store=SettingsStore(tmp_path / "settings.json"))
-        app.model_folder_var.set(str(model_folder))
-        app.settings.model_folder = str(model_folder)
-        app._refresh_models()
+    monkeypatch.setenv("LRR_DISABLE_ANIMATIONS", "1")
+    runtime = FakeRuntime()
+    window = LauncherWindow(
+        store=SettingsStore(tmp_path / "settings.json"), runtime=runtime
+    )
+    qtbot.addWidget(window)
+    window.show()
+    assert window.minimumSize().width() == 960
+    assert window.minimumSize().height() == 640
+    assert window.stack.count() == 3
+    assert not window.windowIcon().isNull()
+    assert all(isinstance(button, ModernButton) for button in window.nav_buttons)
+    window.switch_page(2)
+    assert window.stack.currentWidget().graphicsEffect() is None
+    started = time.perf_counter()
+    for index in range(150):
+        window.switch_page(index % 3)
+    assert time.perf_counter() - started < 1.0
+    assert all(
+        window.stack.widget(index).graphicsEffect() is None
+        for index in range(window.stack.count())
+    )
+    for index in range(600):
+        runtime.events.put_nowait(
+            RuntimeEvent(kind="log", source="stdout", message=str(index))
+        )
+    runtime.events.put_nowait(
+        RuntimeEvent(kind="telemetry", message="snapshot", payload=sample_snapshot())
+    )
+    for width, height in ((960, 640), (1100, 700), (1000, 660), (1180, 760)):
+        window.resize(width, height)
+        qtbot.wait(5)
+    qtbot.waitUntil(
+        lambda: "599" in window.runtime_page.output.toPlainText(), timeout=3000
+    )
+    assert window.runtime_page.dashboard.geometry().bottom() < (
+        window.runtime_page.output.geometry().bottom()
+    )
 
-        app.original_glossary_id = ""
-        app.glossary_name_var.set("Terms")
-        app._render_glossary_rows([])
-        app._add_glossary_row()
-        app.glossary_rows[0]["source"].set("llama")  # type: ignore[union-attr]
-        app.glossary_rows[0]["replacement"].set("羊駝")  # type: ignore[union-attr]
-        app._save_glossary()
 
-        glossary = app.glossaries.get("Terms")
-        assert glossary.entries[0].replacement == "羊駝"
-        assert app.settings.selected_glossary_id == glossary.id
-        assert app.glossary_choice_var.get() == "Terms"
-        assert not hasattr(app, "assignment_glossary_combo")
-        assert not hasattr(app, "profile_glossary_combo")
-
-        app.name_var.set("Pink")
-        app.model_var.set(model.name)
-        app._save_profile()
-
-        persisted = SettingsStore(tmp_path / "settings.json").load()
-        assert persisted.selected_glossary_id == persisted.glossaries[0].id
-        assert "glossary_id" not in persisted.profiles[0].to_dict()
-    finally:
-        root.destroy()
-
-
-def test_lrr_glossary_selection_and_add_entry_update_editor(
-    tmp_path: Path, tk_parent: ctk.CTk
+def test_close_is_idempotent_and_async_for_active_runtime(
+    qtbot, tmp_path: Path
 ) -> None:
-    root = ui_window(tk_parent)
-    try:
-        app = LauncherApp(root, store=SettingsStore(tmp_path / "settings.json"))
-        first = app.glossaries.create(Glossary(name="First"))
-        second = app.glossaries.create(Glossary(name="Second"))
-        app._refresh_glossary_choices(select=first.id)
-
-        app._select_glossary("Second")
-        assert app.original_glossary_id == second.id
-        assert app.glossary_name_var.get() == "Second"
-
-        before = len(app.glossary_rows)
-        app._add_glossary_row()
-        root.update_idletasks()
-        assert len(app.glossary_rows) == before + 1
-        assert app.glossary_rows[-1]["frame"].grid_info()  # type: ignore[union-attr]
-        assert app.glossary_rows[-1]["case_sensitive"].get() is True  # type: ignore[union-attr]
-        assert app.glossary_rows[-1]["source"].get() == ""  # type: ignore[union-attr]
-        assert app.glossary_rows[-1]["enabled_widget"].grid_info()["column"] == 0  # type: ignore[union-attr]
-        assert app.glossary_rows[-1]["remove_widget"].grid_info()["column"] == 4  # type: ignore[union-attr]
-        assert int(app.glossary_entries.cget("height")) >= 300
-    finally:
-        root.destroy()
+    runtime = FakeRuntime()
+    runtime.is_active = True
+    runtime.state = RuntimeState.READY
+    runtime.active_profile = "running"
+    window = LauncherWindow(
+        store=SettingsStore(tmp_path / "settings.json"), runtime=runtime
+    )
+    qtbot.addWidget(window)
+    window.show()
+    window.close()
+    window.close()
+    qtbot.waitUntil(lambda: runtime.closed == 1, timeout=3000)
+    qtbot.waitUntil(lambda: not window.isVisible(), timeout=3000)
 
 
-def test_ui_persists_distinct_lrr_endpoint(
-    tmp_path: Path, tk_parent: ctk.CTk
+def test_keyboard_focus_and_accessible_names(
+    qtbot, tmp_path: Path, monkeypatch
 ) -> None:
-    root = ui_window(tk_parent)
+    monkeypatch.setenv("LRR_DISABLE_ANIMATIONS", "1")
+    page = LrrPage(AppSettings(glossaries=[Glossary(name="Terms")]), SettingsStore(tmp_path / "s.json"))
+    qtbot.addWidget(page)
+    page.show()
+    page.new_button.setFocus()
+    qtbot.keyClick(page.new_button, Qt.Key.Key_Tab)
+    assert page.focusWidget() is not None
+    row = page.add_entry()
+    assert row.remove.accessibleName() == "Remove glossary entry"
+    assert isinstance(row.enabled, SmoothSwitch)
+    row.enabled.setChecked(True)
+    assert row.enabled.get_thumb_position() == 1.0
+    assert page.glossary_list.accessibleName() == "Saved glossaries"
+    assert isinstance(page.port, ModernSpinBox)
+
+
+def test_modern_selector_popup_opens_below_select_bar(qtbot) -> None:
+    combo = ModernComboBox()
+    combo.addItems([f"Option {index}" for index in range(30)])
+    combo.resize(240, 36)
+    combo.move(40, 40)
+    qtbot.addWidget(combo)
+    combo.show()
+    combo.showPopup()
+    qtbot.wait(20)
+    popup = combo.view().window()
+    select_bottom = combo.mapToGlobal(QPoint(0, combo.height())).y()
+    assert popup.geometry().top() >= select_bottom
+    assert popup.geometry().width() >= combo.width()
+    assert isinstance(popup, QFrame)
+    assert popup.frameShape() is QFrame.Shape.NoFrame
+    assert popup.contentsMargins().isNull()
+    row_height = combo.view().sizeHintForRow(0) + combo.view().spacing() * 2
+    assert popup.height() >= row_height * 10
+    assert combo.view().verticalScrollBar().isVisible()
+    combo.hidePopup()
+
+
+def test_application_icon_uses_bundled_blue_asset() -> None:
+    icon_path = (
+        Path(__file__).resolve().parents[1]
+        / "assets"
+        / "LlamaCppLauncher.ico"
+    )
+    assert icon_path.is_file()
+    assert not application_icon().isNull()
+
+
+def test_crash_handler_shows_copyable_log_without_closing_app(qtbot) -> None:
+    app = QApplication.instance()
+    assert isinstance(app, QApplication)
+    host = QFrame()
+    host.setWindowTitle("Still running")
+    qtbot.addWidget(host)
+    host.show()
+    handler = CrashHandler(app)
     try:
-        path = tmp_path / "settings.json"
-        app = LauncherApp(root, store=SettingsStore(path))
-        app.interceptor_host_var.set("127.0.0.1")
-        app.interceptor_port_var.set("9091")
-        app.interceptor_enabled_var.set(False)
-
-        assert app._save_settings()
-        saved = SettingsStore(path).load()
-        assert saved.interceptor_enabled is False
-        assert saved.interceptor_host == "127.0.0.1"
-        assert saved.interceptor_port == 9091
-        assert "LRR disabled" in app.client_endpoint_var.get()
-        assert app.view_switch.cget("values") == ["Settings", "LRR", "Runtime"]
-        app._update_lrr_controls()
-        assert app.interceptor_host_entry.cget("state") == "disabled"
-    finally:
-        root.destroy()
+        raise RuntimeError("profile click exploded")
+    except RuntimeError:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        assert exc_type is not None and exc_value is not None
+        handler.handle_exception(exc_type, exc_value, exc_traceback)
+    qtbot.waitUntil(lambda: bool(handler._dialogs), timeout=1000)
+    dialog = handler._dialogs[0]
+    assert isinstance(dialog, CrashLogDialog)
+    assert "RuntimeError: profile click exploded" in dialog.log_view.toPlainText()
+    qtbot.mouseClick(dialog.copy_button, Qt.MouseButton.LeftButton)
+    assert "profile click exploded" in QApplication.clipboard().text()
+    dialog.reject()
+    qtbot.waitUntil(lambda: not handler._dialogs, timeout=1000)
+    assert host.isVisible()
 
 
-def test_ui_rolls_back_profile_when_persistence_fails(
-    tmp_path: Path, tk_parent: ctk.CTk
-) -> None:
-    model_folder = tmp_path / "models"
-    model_folder.mkdir()
-    model = model_folder / "pink.gguf"
-    model.touch()
-
-    class FailingStore(SettingsStore):
-        def load(self) -> AppSettings:
-            self.last_valid = AppSettings(model_folder=str(model_folder))
-            return self.last_valid
-
-        def save(self, _settings: AppSettings) -> None:
-            raise ValidationError("disk is locked")
-
-    root = ui_window(tk_parent)
+def test_crash_handler_forwards_worker_thread_failure(qtbot) -> None:
+    app = QApplication.instance()
+    assert isinstance(app, QApplication)
+    handler = CrashHandler(app)
+    handler.install()
     try:
-        app = LauncherApp(root, store=FailingStore(tmp_path / "settings.json"))
-        app.model_folder_var.set(str(model_folder))
-        app.settings.model_folder = str(model_folder)
-        app._refresh_models()
-        app.name_var.set("Unsaved")
-        app.model_var.set(model.name)
-        app._save_profile()
+        def fail_in_worker() -> None:
+            raise ValueError("worker exploded")
 
-        assert app.profiles.names() == []
-        assert "disk is locked" in app.error_var.get()
+        worker = threading.Thread(
+            target=fail_in_worker,
+            name="Crash test worker",
+        )
+        worker.start()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        qtbot.waitUntil(lambda: bool(handler._dialogs), timeout=1000)
+        log = handler._dialogs[0].log_view.toPlainText()
+        assert "Thread: Crash test worker" in log
+        assert "ValueError: worker exploded" in log
+        handler._dialogs[0].reject()
     finally:
-        root.destroy()
+        handler.uninstall()
+
+
+def test_packaged_smoke_hook_navigates_and_persists(qtbot, tmp_path: Path) -> None:
+    window = LauncherWindow(
+        store=SettingsStore(tmp_path / "data" / "settings.json"),
+        runtime=FakeRuntime(),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    result = tmp_path / "smoke.json"
+    _run_packaged_smoke(window, result)
+    payload = json.loads(result.read_text(encoding="utf-8"))
+    assert payload == {
+        "ok": True,
+        "pages": [0, 1, 2],
+        "profile": "Packaged Smoke",
+        "glossary": "Packaged Terms",
+    }
