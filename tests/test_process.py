@@ -14,7 +14,11 @@ from llamacpp_launcher.process import ProcessManager, RuntimeEvent, RuntimeState
 
 
 class FakeProcess:
+    _next_pid = 4000
+
     def __init__(self, output: str = "", error: str = "") -> None:
+        type(self)._next_pid += 1
+        self.pid = type(self)._next_pid
         self.stdout = io.StringIO(output)
         self.stderr = io.StringIO(error)
         self.returncode: int | None = None
@@ -61,6 +65,22 @@ def profile(tmp_path: Path) -> Profile:
     model = tmp_path / "model.gguf"
     model.touch()
     return Profile(name="Test", model_path=str(model), gpu_mode=GpuMode.AUTO)
+
+
+def test_owned_process_identity_tracks_only_active_generation(tmp_path: Path) -> None:
+    process = FakeProcess()
+    manager = ProcessManager(
+        popen_factory=lambda *_args, **_kwargs: process,
+        health_checker=lambda *_args: False,
+    )
+    manager.start(tmp_path / "llama-server.exe", profile(tmp_path), "")
+    identity = manager.owned_process
+    assert identity is not None
+    assert identity.pid == process.pid
+    assert identity.generation == 1
+    process.exit(0)
+    process.wait(timeout=0.1)
+    assert manager.owned_process is None
 
 
 def wait_for_state(manager: ProcessManager, state: RuntimeState, timeout: float = 1.0) -> None:

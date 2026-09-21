@@ -10,7 +10,7 @@ from typing import Any
 from .command import supports_option
 from .interceptor import InterceptorServer, upstream_base_url
 from .models import Glossary, Profile, ValidationError
-from .process import ProcessManager, RuntimeEvent, RuntimeState
+from .process import OwnedProcessIdentity, ProcessManager, RuntimeEvent, RuntimeState
 from .telemetry import (
     DashboardSession,
     DashboardSnapshot,
@@ -65,6 +65,10 @@ class LauncherRuntime:
     @property
     def is_active(self) -> bool:
         return self.process.is_active
+
+    @property
+    def owned_process(self) -> OwnedProcessIdentity | None:
+        return self.process.owned_process
 
     @property
     def dashboard_snapshot(self) -> DashboardSnapshot | None:

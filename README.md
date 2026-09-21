@@ -104,9 +104,17 @@ Dashboard 顯示：
 - 最近一筆經由 LRR Client endpoint 的 completion：輸入、輸出、cache token 比例、llama.cpp prompt＋generation 計算時間、首個可見 byte（TTFT）與完整請求時間。
 - Prompt／generation throughput，以及 slot occupancy／deferred request 的五分鐘走勢。
 
+Runtime 頁另有可收合的 Hardware dashboard。頁面可見時每秒於獨立背景執行緒更新，切換到其他頁面會暫停，返回時立即重新取樣；即使 llama.cpp 尚未啟動，整機資料仍會顯示。內容包括：
+
+- 全系統 CPU usage 圓環、透過 Windows performance counter 每秒追蹤的動態平均 CPU frequency，以及 Launcher 持有的 llama-server process CPU 使用率。
+- 每張 NVIDIA、AMD、Intel GPU 各自的 usage／VRAM 圓環，以及 clock、VRAM used/total、temperature 文字。
+- 多張 GPU 超出可用寬度時使用橫向捲動，不會壓縮或覆蓋卡片。
+
+NVIDIA 優先透過 NVML 讀取；AMD、Intel 與 NVIDIA fallback 使用 LibreHardwareMonitor。顯卡驅動、裝置世代、權限或個別 sensor 不支援時，對應欄位會顯示 `Unavailable`，不會阻止 Launcher 啟動。這一版不監控 CPU temperature，也不安裝或修改硬體驅動。
+
 LRR 只保留最近任務的數值摘要，不保存 prompt、response 文字或串流內容。直接呼叫 upstream llama.cpp endpoint 的任務不會出現在「Latest client task」，但若 `/metrics` 可用，仍會反映在 server-wide token 與 throughput 數字中。
 
-`Unsupported` 表示目前 llama.cpp build 沒有對應 flag／endpoint；`Unavailable` 表示尚未取得資料或本次輪詢失敗；連續三個輪詢週期失敗後顯示 `Stale`，同時保留最後已知值。兩個來源獨立判定，因此 metrics 不可用時 slots 仍可正常更新，反之亦然。本 dashboard 不推測 GPU、VRAM、CPU、RAM、溫度或功耗。
+`Unsupported` 表示目前 llama.cpp build 沒有對應 flag／endpoint；`Unavailable` 表示尚未取得資料或本次輪詢失敗；連續三個輪詢週期失敗後顯示 `Stale`，同時保留最後已知值。各 telemetry 來源獨立判定，因此其中一個來源失敗時其他資料仍可正常更新。
 
 第一版沒有系統匣、Windows 自動啟動、最小化啟動、多個同時執行的 Profile 或模型下載功能。
 
@@ -128,10 +136,12 @@ python tests\manual_ui_preview.py
 
 `build.bat` 是本專案唯一正式建置入口。直接雙擊即可一鍵建置；腳本會建立獨立的 `.build-venv`、安裝所需套件、執行完整測試、正常關閉正在使用舊版輸出的 Launcher、移除舊 onedir，並在完成後開啟輸出位置。這能避免全域 Python 的過時套件或缺少 PyQt6 造成損壞的 bundle。
 
+打包階段會隔離 `PATH`，避免其他工具附帶的 Qt／Windows runtime DLL 被誤收進 EXE。完成前會使用隔離的資料目錄實際啟動 onefile EXE，驗證 Qt 頁面、設定儲存與硬體 provider 載入；若啟動失敗或逾時，建置會判定失敗。診斷結果保留在 `.tmp/packaged-smoke-*`，不會覆寫使用者的 profile 或術語表。
+
 輸出位於：
 
 ```text
 dist\LlamaCppLauncher.exe
 ```
 
-採用 `onefile` 且不顯示額外 Console，因此發布與移動時只需要 `LlamaCppLauncher.exe`。程式啟動時會把內含的 Python、PyQt6 與 aiohttp runtime 暫時解壓到系統 `%TEMP%`；`llama-server.exe` 與模型仍由使用者從 UI 選擇，不會包含在 EXE 內。
+採用 `onefile` 且不顯示額外 Console，因此發布與移動時只需要 `LlamaCppLauncher.exe`。程式啟動時會把內含的 Python、PyQt6、aiohttp 與硬體監控 runtime 暫時解壓到系統 `%TEMP%`；`llama-server.exe`、顯卡驅動與模型仍由使用者從 UI 選擇或自行安裝，不會包含在 EXE 內。

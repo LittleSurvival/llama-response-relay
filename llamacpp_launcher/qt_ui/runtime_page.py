@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QSettings, pyqtSignal
 from PyQt6.QtGui import QColor, QTextCursor
 from PyQt6.QtWidgets import (
     QGridLayout,
@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..process import RuntimeState
+from ..hardware import HardwareSnapshot
 from ..telemetry import (
     Availability,
     DashboardSnapshot,
@@ -24,6 +25,7 @@ from ..telemetry import (
 )
 from .charts import CompactChart
 from .components import card, make_button, section_header
+from .hardware_dashboard import HardwareDashboard
 from .presentation import control_states, per_active_slot_rate
 
 
@@ -58,7 +60,14 @@ class RuntimePage(QWidget):
     stop_requested = pyqtSignal()
     restart_requested = pyqtSignal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    hardware_refresh_requested = pyqtSignal()
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        presentation_settings: QSettings | None = None,
+    ) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -136,7 +145,14 @@ class RuntimePage(QWidget):
         dashboard_layout.addLayout(charts)
         layout.addWidget(self.dashboard, 0)
 
-        output_card, output_layout = card()
+        self.hardware_dashboard = HardwareDashboard(settings=presentation_settings)
+        self.hardware_dashboard.refresh_requested.connect(
+            self.hardware_refresh_requested
+        )
+        layout.addWidget(self.hardware_dashboard, 0)
+
+        self.output_card, output_layout = card()
+        self.output_card.setMinimumHeight(130)
         output_layout.addWidget(
             section_header("Process output", "Recent stdout and stderr from the owned process.")
         )
@@ -149,7 +165,7 @@ class RuntimePage(QWidget):
             "font-family:Consolas; border-radius:10px; padding:8px; }"
         )
         output_layout.addWidget(self.output, 1)
-        layout.addWidget(output_card, 1)
+        layout.addWidget(self.output_card, 1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -252,6 +268,9 @@ class RuntimePage(QWidget):
         if follow:
             self.output.setTextCursor(cursor)
             bar.setValue(bar.maximum())
+
+    def render_hardware_snapshot(self, snapshot: HardwareSnapshot) -> None:
+        self.hardware_dashboard.set_snapshot(snapshot)
 
 
 def _latest_text(snapshot: DashboardSnapshot) -> str:

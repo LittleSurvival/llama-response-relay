@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
-from llamacpp_launcher.command import build_command, parse_custom_args
+from llamacpp_launcher.command import build_command, parse_custom_args, probe_help
 from llamacpp_launcher.models import FlashAttention, GpuMode, Profile, ValidationError
 
 
@@ -24,6 +25,28 @@ def configured_profile(tmp_path: Path) -> Profile:
         no_mmap=True,
         custom_args='--threads 8 --alias "Pink Model"',
     )
+
+
+def test_cold_help_probe_has_full_startup_budget(monkeypatch) -> None:
+    def slow_probe(command, **kwargs):
+        # Model a cold options probe requiring more than the old ten seconds.
+        if kwargs["timeout"] < 15:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, "--metrics --slots")
+
+    monkeypatch.setattr(subprocess, "run", slow_probe)
+    assert probe_help(Path("llama-server.exe")) == "--metrics --slots"
+    with pytest.raises(ValidationError, match="model has not started loading"):
+        probe_help(Path("llama-server.exe"), timeout_seconds=10)
+
+
+def test_help_probe_rejects_failed_process(monkeypatch) -> None:
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 1, "backend failed"),
+    )
+    with pytest.raises(ValidationError, match="backend failed"):
+        probe_help(Path("llama-server.exe"))
 
 
 def test_build_command_is_deterministic_and_preserves_spaces(tmp_path: Path) -> None:

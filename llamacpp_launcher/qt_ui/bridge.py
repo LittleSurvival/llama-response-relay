@@ -9,6 +9,7 @@ from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
 
 from ..process import RuntimeEvent
 from ..runtime import LauncherRuntime
+from ..hardware import HardwareCollector, HardwareSnapshot
 
 
 class WorkerSignals(QObject):
@@ -104,3 +105,36 @@ class RuntimeBridge(QObject):
     def _emit_state(self, event: RuntimeEvent) -> None:
         if event.state is not None:
             self.state_changed.emit(event.state, event.message)
+
+
+class HardwareBridge(QObject):
+    snapshot_ready = pyqtSignal(object)
+
+    def __init__(
+        self,
+        process_source: Callable[[], object | None],
+        *,
+        collector: HardwareCollector | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.collector = collector or HardwareCollector(
+            self._forward,
+            process_source=process_source,
+        )
+        self.collector.callback = self._forward
+
+    def _forward(self, snapshot: HardwareSnapshot) -> None:
+        self.snapshot_ready.emit(snapshot)
+
+    def resume(self) -> None:
+        self.collector.resume()
+
+    def suspend(self) -> None:
+        self.collector.suspend()
+
+    def request_sample(self) -> None:
+        self.collector.request_sample()
+
+    def stop(self) -> None:
+        self.collector.stop()

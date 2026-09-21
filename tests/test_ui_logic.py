@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QPoint, QTimer, Qt
+from PyQt6.QtCore import QPoint, QSettings, QTimer, Qt
 from PyQt6.QtWidgets import QApplication, QFrame, QMessageBox
 
 from llamacpp_launcher.models import (
@@ -15,6 +15,12 @@ from llamacpp_launcher.models import (
     Glossary,
     GlossaryEntry,
     Profile,
+)
+from llamacpp_launcher.hardware import (
+    CpuSample,
+    GpuSample,
+    HardwareSnapshot,
+    MetricReading,
 )
 from llamacpp_launcher.process import RuntimeEvent, RuntimeState
 from llamacpp_launcher.qt_ui.bridge import RuntimeBridge
@@ -28,6 +34,7 @@ from llamacpp_launcher.qt_ui.components import (
 )
 from llamacpp_launcher.qt_ui.crash_handler import CrashHandler, CrashLogDialog
 from llamacpp_launcher.qt_ui.lrr_page import LrrPage
+from llamacpp_launcher.qt_ui.hardware_dashboard import DonutGauge, HardwareDashboard
 from llamacpp_launcher.qt_ui.presentation import (
     context_per_slot_text,
     control_states,
@@ -65,6 +72,27 @@ class FakeRuntime:
     def close(self, *, timeout_seconds: float = 10.0) -> None:
         self.stop(timeout_seconds=timeout_seconds)
         self.closed += 1
+
+
+class FakeHardwareCollector:
+    def __init__(self) -> None:
+        self.callback = lambda _snapshot: None
+        self.resume_calls = 0
+        self.suspend_calls = 0
+        self.sample_requests = 0
+        self.stop_calls = 0
+
+    def resume(self) -> None:
+        self.resume_calls += 1
+
+    def suspend(self) -> None:
+        self.suspend_calls += 1
+
+    def request_sample(self) -> None:
+        self.sample_requests += 1
+
+    def stop(self) -> None:
+        self.stop_calls += 1
 
 
 def sample_snapshot(
@@ -112,6 +140,32 @@ def sample_snapshot(
         ),
         history=history,
         stopped=stopped,
+    )
+
+
+def hardware_snapshot(*, gpu_count: int = 2) -> HardwareSnapshot:
+    gpus = tuple(
+        GpuSample(
+            identifier=f"gpu-{index}",
+            vendor=("NVIDIA", "AMD", "Intel")[index % 3],
+            name=f"Test GPU {index}",
+            utilization=MetricReading.number(40 + index),
+            frequency_mhz=MetricReading.number(2200 + index * 100),
+            vram_used_bytes=MetricReading.number((index + 1) * 1024**3),
+            vram_total_bytes=MetricReading.number(8 * 1024**3),
+            temperature_c=MetricReading.number(60 + index),
+            source="fake",
+        )
+        for index in range(gpu_count)
+    )
+    return HardwareSnapshot(
+        timestamp=time.monotonic(),
+        cpu=CpuSample(
+            utilization=MetricReading.number(35),
+            frequency_mhz=MetricReading.number(4300),
+            process_utilization=MetricReading.number(12),
+        ),
+        gpus=gpus,
     )
 
 
@@ -395,6 +449,102 @@ def test_runtime_page_renders_states_logs_and_minimum_dashboard(qtbot) -> None:
     assert page.output.document().blockCount() <= 2000
 
 
+def test_hardware_dashboard_renders_donuts_text_and_multi_gpu_overflow(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = QSettings(
+        str(tmp_path / "presentation.ini"), QSettings.Format.IniFormat
+    )
+    dashboard = HardwareDashboard(settings=settings)
+    qtbot.addWidget(dashboard)
+    dashboard.resize(720, 190)
+    dashboard.show()
+    dashboard.set_snapshot(hardware_snapshot(gpu_count=3))
+    qtbot.wait(20)
+
+    assert dashboard.cpu_card.usage.accessibleDescription() == "CPU usage: 35%"
+    assert "4.30 GHz" in dashboard.cpu_card.frequency.text()
+    assert "12%" in dashboard.cpu_card.process.text()
+    assert len(dashboard._gpu_cards) == 3
+    first = dashboard._gpu_cards["gpu-0"]
+    assert isinstance(first.usage, DonutGauge)
+    assert first.usage.accessibleDescription() == "GPU usage: 40%"
+    assert "1.0 / 8.0 GiB" in first.memory.text()
+    assert "60 °C" in first.temperature.text()
+    assert dashboard.scroll.horizontalScrollBar().maximum() > 0
+
+    unavailable = hardware_snapshot(gpu_count=1)
+    missing = GpuSample("gpu-x", "Intel", "Partial GPU")
+    dashboard.set_snapshot(
+        HardwareSnapshot(unavailable.timestamp, unavailable.cpu, (missing,))
+    )
+    assert (
+        dashboard._gpu_cards["gpu-x"].usage.accessibleDescription()
+        == "GPU usage: —"
+    )
+    assert "Unavailable" in dashboard._gpu_cards["gpu-x"].temperature.text()
+    dashboard.set_snapshot(
+        HardwareSnapshot(time.monotonic() - 4, unavailable.cpu, ())
+    )
+    assert dashboard.no_gpu.isVisible()
+    dashboard._refresh_stale_state()
+    assert dashboard.status.text() == "Stale"
+
+
+def test_hardware_dashboard_collapse_persists_and_requests_refresh(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = QSettings(
+        str(tmp_path / "presentation.ini"), QSettings.Format.IniFormat
+    )
+    first = HardwareDashboard(settings=settings)
+    qtbot.addWidget(first)
+    refreshes: list[bool] = []
+    first.refresh_requested.connect(lambda: refreshes.append(True))
+    first.set_expanded(False)
+    assert first.height() == 44
+    assert not first.scroll.isVisible()
+    first.set_expanded(True)
+    assert refreshes == [True]
+    assert first.height() == 190
+
+    restored = HardwareDashboard(settings=settings)
+    qtbot.addWidget(restored)
+    assert restored.expanded
+    restored.set_expanded(False)
+    reloaded = HardwareDashboard(settings=settings)
+    qtbot.addWidget(reloaded)
+    assert not reloaded.expanded
+
+
+def test_runtime_page_hardware_layout_preserves_output_and_device_widgets(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = QSettings(
+        str(tmp_path / "presentation.ini"), QSettings.Format.IniFormat
+    )
+    page = RuntimePage(presentation_settings=settings)
+    qtbot.addWidget(page)
+    page.resize(960, 608)
+    page.show()
+    page.render_hardware_snapshot(hardware_snapshot(gpu_count=3))
+    qtbot.wait(20)
+    original_cards = dict(page.hardware_dashboard._gpu_cards)
+    page.render_hardware_snapshot(hardware_snapshot(gpu_count=3))
+    assert page.hardware_dashboard._gpu_cards == original_cards
+    assert page.output.height() >= 40
+    for width, height in ((960, 608), (1100, 700), (980, 640), (1180, 720)):
+        page.resize(width, height)
+        qtbot.wait(2)
+    assert page.dashboard.geometry().bottom() < (
+        page.hardware_dashboard.geometry().top()
+    )
+    assert (
+        page.hardware_dashboard.geometry().bottom()
+        < page.output_card.geometry().top()
+    )
+
+
 def test_window_uses_three_qt_pages_and_resizes_under_load(
     qtbot, tmp_path: Path, monkeypatch
 ) -> None:
@@ -436,6 +586,28 @@ def test_window_uses_three_qt_pages_and_resizes_under_load(
     assert window.runtime_page.dashboard.geometry().bottom() < (
         window.runtime_page.output.geometry().bottom()
     )
+
+
+def test_window_suspends_and_resumes_hardware_collection_with_page(
+    qtbot, tmp_path: Path
+) -> None:
+    hardware = FakeHardwareCollector()
+    window = LauncherWindow(
+        store=SettingsStore(tmp_path / "settings.json"),
+        runtime=FakeRuntime(),
+        hardware_collector=hardware,  # type: ignore[arg-type]
+    )
+    qtbot.addWidget(window)
+    window.show()
+    window.switch_page(2)
+    assert hardware.resume_calls == 1
+    window.runtime_page.hardware_dashboard.set_expanded(False)
+    window.runtime_page.hardware_dashboard.set_expanded(True)
+    assert hardware.sample_requests == 1
+    window.switch_page(0)
+    assert hardware.suspend_calls == 1
+    window.close()
+    assert hardware.stop_calls == 1
 
 
 def test_close_is_idempotent_and_async_for_active_runtime(
@@ -572,4 +744,5 @@ def test_packaged_smoke_hook_navigates_and_persists(qtbot, tmp_path: Path) -> No
         "pages": [0, 1, 2],
         "profile": "Packaged Smoke",
         "glossary": "Packaged Terms",
+        "hardware_provider_assets": True,
     }

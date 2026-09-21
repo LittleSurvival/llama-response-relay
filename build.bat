@@ -43,6 +43,9 @@ set "QT_QPA_PLATFORM=offscreen"
 if errorlevel 1 goto :failed
 
 echo [5/7] Building console-free onefile package...
+rem Do not collect unrelated native DLLs from tools injected into the caller's PATH.
+set "LRR_ORIGINAL_PATH=%PATH%"
+set "PATH=%CD%\.build-venv\Scripts;%SystemRoot%\System32;%SystemRoot%"
 "%BUILD_PYTHON%" -m PyInstaller --clean --noconfirm LlamaCppLauncher.spec
 if errorlevel 1 goto :failed
 
@@ -50,6 +53,11 @@ if not exist "%OUTPUT_EXE%" (
   echo ERROR: Build finished without producing the expected executable.
   goto :failed
 )
+
+echo Verifying the packaged executable in an isolated data directory...
+"%BUILD_PYTHON%" scripts\smoke_packaged.py "%OUTPUT_EXE%"
+if errorlevel 1 goto :failed
+set "PATH=%LRR_ORIGINAL_PATH%"
 
 echo [6/7] Removing legacy onedir output...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^

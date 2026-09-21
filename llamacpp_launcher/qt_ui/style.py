@@ -123,6 +123,13 @@ def apply_theme(app: QApplication) -> None:
         QScrollArea {{ border: none; background: transparent; }}
         QScrollBar:vertical {{ width: 10px; background: transparent; }}
         QScrollBar::handle:vertical {{ min-height: 28px; background: #d9b8c7; border-radius: 5px; }}
+        QScrollBar:horizontal {{ height: 10px; background: transparent; }}
+        QScrollBar::handle:horizontal {{ min-width: 36px; background: #d9b8c7; border-radius: 5px; }}
+        QPushButton#HardwareCollapseButton {{
+            min-height: 26px; padding: 0; border: none; border-radius: 8px;
+            color: {COLORS["muted"]}; font-size: 16px;
+        }}
+        QPushButton#HardwareCollapseButton:hover {{ background: {COLORS["surface_alt"]}; }}
         QToolTip {{ color: {COLORS["text"]}; background: {COLORS["surface"]}; border: 1px solid {COLORS["border"]}; }}
         """
     )

@@ -2,6 +2,7 @@
 
 from importlib.util import find_spec
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 
 project_root = Path(SPECPATH)
@@ -10,7 +11,7 @@ if not icon_path.is_file():
     raise RuntimeError(f"Missing application icon: {icon_path}")
 missing = [
     dependency
-    for dependency in ("aiohttp", "PyQt6")
+    for dependency in ("aiohttp", "HardwareMonitor", "psutil", "PyQt6", "pynvml")
     if find_spec(dependency) is None
 ]
 if missing:
@@ -19,12 +20,29 @@ if missing:
         + ", ".join(missing)
         + '. Run build.bat or install the project with: pip install -e ".[dev]"'
     )
+hardware_datas, hardware_binaries, hardware_hiddenimports = collect_all(
+    "HardwareMonitor"
+)
+notice_path = project_root / "THIRD_PARTY_NOTICES.md"
+if not notice_path.is_file():
+    raise RuntimeError(f"Missing third-party notices: {notice_path}")
+
 analysis = Analysis(
     [str(project_root / "launcher.py")],
     pathex=[str(project_root)],
-    binaries=[],
-    datas=[(str(icon_path), "assets")],
-    hiddenimports=[],
+    binaries=hardware_binaries,
+    datas=[
+        (str(icon_path), "assets"),
+        (str(notice_path), "."),
+        *hardware_datas,
+    ],
+    hiddenimports=[
+        "clr",
+        "clr_loader",
+        "pythonnet",
+        "pynvml",
+        *hardware_hiddenimports,
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

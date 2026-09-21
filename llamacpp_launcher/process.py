@@ -35,10 +35,17 @@ class RuntimeEvent:
     payload: Any = None
 
 
+@dataclass(frozen=True, slots=True)
+class OwnedProcessIdentity:
+    pid: int
+    generation: int
+
+
 class ProcessLike(Protocol):
     stdout: IO[str] | None
     stderr: IO[str] | None
     returncode: int | None
+    pid: int
 
     def poll(self) -> int | None: ...
     def wait(self, timeout: float | None = None) -> int: ...
@@ -83,6 +90,17 @@ class ProcessManager:
     def is_active(self) -> bool:
         with self._lock:
             return self._process is not None and self._process.poll() is None
+
+    @property
+    def owned_process(self) -> OwnedProcessIdentity | None:
+        with self._lock:
+            process = self._process
+            if process is None or process.poll() is not None:
+                return None
+            pid = getattr(process, "pid", None)
+            if not isinstance(pid, int) or pid <= 0:
+                return None
+            return OwnedProcessIdentity(pid=pid, generation=self._generation)
 
     def start(
         self,

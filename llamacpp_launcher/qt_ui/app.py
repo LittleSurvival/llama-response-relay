@@ -66,6 +66,7 @@ def _run_packaged_smoke(window: LauncherWindow, result_path: Path) -> None:
             "pages": visited,
             "profile": reloaded.selected_profile,
             "glossary": reloaded.glossaries[0].name,
+            "hardware_provider_assets": _probe_hardware_provider_assets(),
         }
     except Exception as exc:
         payload = {"ok": False, "error": str(exc)}
@@ -75,3 +76,12 @@ def _run_packaged_smoke(window: LauncherWindow, result_path: Path) -> None:
     )
     window._allow_close = True
     window.close()
+
+
+def _probe_hardware_provider_assets() -> bool:
+    """Ensure one-file packaging can load every hardware provider runtime."""
+    import psutil
+    import pynvml
+    from HardwareMonitor.Hardware import Computer
+
+    return all((psutil, pynvml, Computer))

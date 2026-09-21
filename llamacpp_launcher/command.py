@@ -86,7 +86,9 @@ def build_command(executable: Path, profile: Profile, help_text: str = "") -> li
     return command
 
 
-def probe_help(executable: Path, timeout_seconds: float = 10.0) -> str:
+def probe_help(executable: Path, timeout_seconds: float = 120.0) -> str:
+    if timeout_seconds <= 0:
+        raise ValidationError("Options inspection timeout must be positive.")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
         result = subprocess.run(
@@ -102,8 +104,18 @@ def probe_help(executable: Path, timeout_seconds: float = 10.0) -> str:
             shell=False,
             creationflags=creationflags,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise ValidationError(
+            f"llama.cpp options inspection (--help) timed out after {timeout_seconds:g}s. "
+            "The model has not started loading. Increase Startup timeout and try again."
+        ) from exc
+    except OSError as exc:
         raise ValidationError(f"Could not inspect llama.cpp options: {exc}") from exc
+    if result.returncode != 0:
+        raise ValidationError(
+            f"llama.cpp options inspection (--help) exited with code {result.returncode}: "
+            f"{result.stdout[-2000:]}"
+        )
     return result.stdout
 
 

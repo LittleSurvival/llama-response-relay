@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -18,11 +18,12 @@ from PyQt6.QtWidgets import (
 from ..command import probe_help
 from ..discovery import discover_models, resolve_llama_server
 from ..glossaries import GlossaryService
+from ..hardware import HardwareCollector
 from ..models import AppSettings, ValidationError
 from ..process import RuntimeState
 from ..runtime import LauncherRuntime
 from ..storage import SettingsStore
-from .bridge import RuntimeBridge
+from .bridge import HardwareBridge, RuntimeBridge
 from .lrr_page import LrrPage
 from .presentation import endpoint_text
 from .runtime_page import RuntimePage
@@ -37,6 +38,7 @@ class LauncherWindow(QMainWindow):
         *,
         store: SettingsStore | None = None,
         runtime: LauncherRuntime | None = None,
+        hardware_collector: HardwareCollector | None = None,
     ) -> None:
         super().__init__()
         self.store = store or SettingsStore()
@@ -48,6 +50,14 @@ class LauncherWindow(QMainWindow):
             self.load_error = str(exc)
         self.runtime = runtime or LauncherRuntime()
         self.bridge = RuntimeBridge(self.runtime, parent=self)
+        self.hardware_bridge = HardwareBridge(
+            lambda: getattr(self.runtime, "owned_process", None),
+            collector=hardware_collector,
+            parent=self,
+        )
+        self.presentation_settings = QSettings(
+            "LlamaResponseRelay", "LlamaCppLauncher"
+        )
         self._closing = False
         self._allow_close = False
         self._build()
@@ -105,7 +115,9 @@ class LauncherWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.settings_page = SettingsPage(self.settings, self.store)
         self.lrr_page = LrrPage(self.settings, self.store)
-        self.runtime_page = RuntimePage()
+        self.runtime_page = RuntimePage(
+            presentation_settings=self.presentation_settings
+        )
         self.stack.addWidget(self.settings_page)
         self.stack.addWidget(self.lrr_page)
         self.stack.addWidget(self.runtime_page)
@@ -129,6 +141,12 @@ class LauncherWindow(QMainWindow):
         self.bridge.state_changed.connect(self._runtime_state_changed)
         self.bridge.logs_ready.connect(self.runtime_page.append_logs)
         self.bridge.telemetry_ready.connect(self.runtime_page.render_snapshot)
+        self.hardware_bridge.snapshot_ready.connect(
+            self.runtime_page.render_hardware_snapshot
+        )
+        self.runtime_page.hardware_refresh_requested.connect(
+            self.hardware_bridge.request_sample
+        )
         self.bridge.error.connect(self._background_error)
         self.bridge.work_finished.connect(self._sync_runtime_controls)
 
@@ -136,6 +154,10 @@ class LauncherWindow(QMainWindow):
         if index < 0 or index >= self.stack.count():
             return
         self.stack.setCurrentIndex(index)
+        if index == 2:
+            self.hardware_bridge.resume()
+        else:
+            self.hardware_bridge.suspend()
         for button_index, button in enumerate(self.nav_buttons):
             button.setChecked(button_index == index)
         self.stack.currentWidget().update()
@@ -210,15 +232,17 @@ class LauncherWindow(QMainWindow):
             return
         self._set_lifecycle_busy()
         self.switch_page(2)
+        self.statusBar().showMessage("Inspecting llama.cpp options (first launch may take longer)…")
+        startup_timeout = self.settings.startup_timeout_seconds
 
         def lifecycle() -> None:
-            help_text = probe_help(executable)
+            help_text = probe_help(executable, timeout_seconds=startup_timeout)
             arguments = {
                 "interceptor_enabled": self.settings.interceptor_enabled,
                 "interceptor_host": self.settings.interceptor_host,
                 "interceptor_port": self.settings.interceptor_port,
                 "glossary": glossary,
-                "startup_timeout_seconds": self.settings.startup_timeout_seconds,
+                "startup_timeout_seconds": startup_timeout,
             }
             if action == "start":
                 self.runtime.start(executable, profile, help_text, **arguments)
@@ -269,6 +293,7 @@ class LauncherWindow(QMainWindow):
         QMessageBox.critical(self, "Llama.cpp Launcher", message)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.hardware_bridge.stop()
         if self._allow_close or not self.runtime.is_active:
             event.accept()
             return
